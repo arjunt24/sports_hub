@@ -1,4 +1,6 @@
-from flask import Flask, jsonify
+# https://dashboard.render.com/web/srv-d3sq1lhr0fns738mcp9g
+
+from flask import Flask, jsonify, request
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -70,42 +72,143 @@ def get_lakers_schedule():
 
         schedule.append(game_data)
 
-    return jsonify({'upcoming_schedule': schedule})
+    resp = {'upcoming_schedule': schedule}
+
+    if request.args.get('nbapiformat') == 'true':
+        return jsonify(convert_to_nba_api_format(resp))
+    
+    return jsonify(resp)
 
 def convert_date(date_str):
-    # Current date
     today = datetime.today()
 
-    # Try parsing with current year first
     try:
         candidate_date = datetime.strptime(date_str + f" {today.year}", "%a, %b %d %Y")
     except ValueError:
-        # If weekday is missing, try without it
         candidate_date = datetime.strptime(date_str + f" {today.year}", "%b %d %Y")
 
-    # If the date has already passed this year, use next year
     if candidate_date.date() < today.date():
         candidate_date = candidate_date.replace(year=today.year + 1)
 
     return candidate_date.strftime("%m/%d/%Y")
 
 def convert_to_utc(date_str, time_str):
-    # Combine date and time into one string
     dt_str = f"{date_str} {time_str}"
-
-    # Parse the combined string into a naive datetime object
     local_dt = datetime.strptime(dt_str, "%m/%d/%Y %I:%M %p")
-
-    # Define Eastern Time with daylight saving support
     eastern = pytz.timezone("US/Eastern")
-
-    # Localize the naive datetime to Eastern Time
     localized_dt = eastern.localize(local_dt)
-
-    # Convert to UTC
     utc_dt = localized_dt.astimezone(pytz.utc)
 
     return utc_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def convert_to_nba_api_format(original_json):
+    def parse_datetime(dt_str):
+        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S %Z")
+        gdte = dt.strftime("%Y-%m-%d")
+        utctm = dt.strftime("%H:%M")
+        etm = dt.strftime("%Y-%m-%dT%H:%M:%S")
+        return gdte, utctm, etm
+
+    games = []
+    for i, game in enumerate(original_json.get("upcoming_schedule", [])):
+        dt_str = game.get("DATETIME", "")
+        gdte, utctm, etm = parse_datetime(dt_str) if dt_str else ("", "", "")
+        
+        opponent = game.get("OPPONENT", "")
+        is_home = game.get("IS_HOME", False)
+        tv = game.get("TV", "")
+
+        gid = f"00125000{i+1:02d}"
+        gcode = f"{gdte.replace('-', '')}/{'LAL' + opponent[:3].upper()}" if gdte and opponent else ""
+
+        home_team = NBA_TEAMS["Los Angeles"]
+        away_team = NBA_TEAMS.get(opponent, {"tid": "", "ta": "", "tn": "", "tc": opponent})
+
+        h_team = home_team if is_home else away_team
+        v_team = away_team if is_home else home_team
+
+        game_obj = {
+            "gid": gid,
+            "gcode": gcode,
+            "seri": "",
+            "is": int(is_home),
+            "gdte": gdte,
+            "htm": etm,
+            "vtm": etm,
+            "etm": etm,
+            "an": "",
+            "ac": "",
+            "as": "",
+            "st": "",
+            "stt": "",
+            "bd": {
+                "b": []
+            },
+            "v": {
+                "tid": v_team["tid"],
+                "re": "",
+                "ta": v_team["ta"],
+                "tn": v_team["tn"],
+                "tc": v_team["tc"],
+                "s": ""
+            },
+            "h": {
+                "tid": h_team["tid"],
+                "re": "",
+                "ta": h_team["ta"],
+                "tn": h_team["tn"],
+                "tc": h_team["tc"],
+                "s": ""
+            },
+            "gdtutc": gdte,
+            "utctm": utctm,
+            "ppdst": ""
+        }
+        games.append(game_obj)
+
+    return {
+        "gscd": {
+            "tid": NBA_TEAMS["Los Angeles"]["tid"],
+            "g": games,
+            "ta": NBA_TEAMS["Los Angeles"]["ta"],
+            "tn": NBA_TEAMS["Los Angeles"]["tn"],
+            "tc": NBA_TEAMS["Los Angeles"]["tc"]
+        }
+    }
+    
+NBA_TEAMS = {
+    "Atlanta":      {"tid": 1610612737, "ta": "ATL", "tn": "Hawks", "tc": "Atlanta"},
+    "Boston":       {"tid": 1610612738, "ta": "BOS", "tn": "Celtics", "tc": "Boston"},
+    "Brooklyn":     {"tid": 1610612751, "ta": "BKN", "tn": "Nets", "tc": "Brooklyn"},
+    "Charlotte":    {"tid": 1610612766, "ta": "CHA", "tn": "Hornets", "tc": "Charlotte"},
+    "Chicago":      {"tid": 1610612741, "ta": "CHI", "tn": "Bulls", "tc": "Chicago"},
+    "Cleveland":    {"tid": 1610612739, "ta": "CLE", "tn": "Cavaliers", "tc": "Cleveland"},
+    "Dallas":       {"tid": 1610612742, "ta": "DAL", "tn": "Mavericks", "tc": "Dallas"},
+    "Denver":       {"tid": 1610612743, "ta": "DEN", "tn": "Nuggets", "tc": "Denver"},
+    "Detroit":      {"tid": 1610612765, "ta": "DET", "tn": "Pistons", "tc": "Detroit"},
+    "Golden State": {"tid": 1610612744, "ta": "GSW", "tn": "Warriors", "tc": "Golden State"},
+    "Houston":      {"tid": 1610612745, "ta": "HOU", "tn": "Rockets", "tc": "Houston"},
+    "Indiana":      {"tid": 1610612754, "ta": "IND", "tn": "Pacers", "tc": "Indiana"},
+    "LA":  {"tid": 1610612746, "ta": "LAC", "tn": "Clippers", "tc": "LA"},
+    "Los Angeles":  {"tid": 1610612747, "ta": "LAL", "tn": "Lakers", "tc": "Los Angeles"},
+    "Memphis":      {"tid": 1610612763, "ta": "MEM", "tn": "Grizzlies", "tc": "Memphis"},
+    "Miami":        {"tid": 1610612748, "ta": "MIA", "tn": "Heat", "tc": "Miami"},
+    "Milwaukee":    {"tid": 1610612749, "ta": "MIL", "tn": "Bucks", "tc": "Milwaukee"},
+    "Minnesota":    {"tid": 1610612750, "ta": "MIN", "tn": "Timberwolves", "tc": "Minnesota"},
+    "New Orleans":  {"tid": 1610612740, "ta": "NOP", "tn": "Pelicans", "tc": "New Orleans"},
+    "New York":     {"tid": 1610612752, "ta": "NYK", "tn": "Knicks", "tc": "New York"},
+    "Oklahoma City":{"tid": 1610612760, "ta": "OKC", "tn": "Thunder", "tc": "Oklahoma City"},
+    "Orlando":      {"tid": 1610612753, "ta": "ORL", "tn": "Magic", "tc": "Orlando"},
+    "Philadelphia": {"tid": 1610612755, "ta": "PHI", "tn": "76ers", "tc": "Philadelphia"},
+    "Phoenix":      {"tid": 1610612756, "ta": "PHX", "tn": "Suns", "tc": "Phoenix"},
+    "Portland":     {"tid": 1610612757, "ta": "POR", "tn": "Trail Blazers", "tc": "Portland"},
+    "Sacramento":   {"tid": 1610612758, "ta": "SAC", "tn": "Kings", "tc": "Sacramento"},
+    "San Antonio":  {"tid": 1610612759, "ta": "SAS", "tn": "Spurs", "tc": "San Antonio"},
+    "Toronto":      {"tid": 1610612761, "ta": "TOR", "tn": "Raptors", "tc": "Toronto"},
+    "Utah":         {"tid": 1610612762, "ta": "UTA", "tn": "Jazz", "tc": "Utah"},
+    "Washington":   {"tid": 1610612764, "ta": "WAS", "tn": "Wizards", "tc": "Washington"}
+}
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=10000)

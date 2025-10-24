@@ -5,12 +5,66 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import pytz
+import copy
 
 app = Flask(__name__)
 
-@app.route('/lakers-schedule', methods=['GET'])
-def get_lakers_schedule():
-    url = 'https://www.espn.com/nba/team/schedule/_/name/lal/los-angeles-lakers'
+@app.route('/nba/schedule/<team_acronym>', methods=['GET'])
+def get_nba_team_schedule(team_acronym):
+    nba_teams_data = fetch_standings_data(NBA_TEAMS_DATA)
+    my_team_data = [team for team in nba_teams_data if team.get("espn-acronym") == team_acronym.upper()][0]
+    schedule = fetch_team_schedule_data(nba_teams_data, my_team_data)
+    resp = {'upcoming_schedule': schedule}
+
+    if request.args.get('nbapiformat') == 'true':
+        resp = convert_to_nba_api_format(resp, nba_teams_data, my_team_data)
+
+    return jsonify(resp)
+
+def fetch_standings_data(nba_teams_data):
+    soup = fetch_soup(f'https://www.espn.com/nba/standings/_/group/conference')
+    if not soup:
+        return jsonify({'error': f'Failed to parse standings: {url}'}), 500
+    tables = soup.find_all('tbody', class_='Table__TBODY')
+
+    for i, table in enumerate(tables):
+        conf = 'W' if i > 1 else 'E'
+        for conf_rank, row in enumerate(table.find_all('tr')):
+            if i % 2 == 0:
+                team_data = [team for team in nba_teams_data if team.get("espn-acronym") in [row.text[:2], row.text[:3]]][0]
+                team_data['conf'] = conf
+                team_data['conf_rank'] = conf_rank + 1
+            else:
+                team_data = [team for team in nba_teams_data if team.get("conf") == conf and team.get("conf_rank") == conf_rank + 1][0]
+                win_cell, loss_cell = row.find_all('td')[:2]
+                team_data['record-wins'] = win_cell.text
+                team_data['record-losses'] = loss_cell.text
+
+    return nba_teams_data
+
+def fetch_team_schedule_data(nba_teams_data, my_team_data):
+    soup = fetch_soup(f'https://www.espn.com/nba/team/schedule/_/name/{my_team_data.get("acronym")}/{my_team_data.get("url-name")}')
+    if not soup:
+        return jsonify({'error': f'Failed to parse schedule: {url}'}), 500
+    table = soup.find('tbody', class_='Table__TBODY')
+
+    schedule_data = []
+    col_names = None
+    pre_header_row_found = False
+    for row in table.find_all('tr'):
+        if col_names is None: 
+            if 'Table_Headers' in row.find('td')['class']:
+                if not pre_header_row_found:
+                    pre_header_row_found = True
+                else:
+                    col_names = [header.text.strip() for header in row.find_all('td')]
+            continue
+
+        schedule_data.append(format_game_data(nba_teams_data, my_team_data, col_names, row.find_all('td')))
+
+    return schedule_data
+
+def fetch_soup(url):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -19,65 +73,49 @@ def get_lakers_schedule():
     }
 
     response = requests.get(url, headers=headers)
-
     if response.status_code != 200:
-        return jsonify({'error': 'Failed to fetch schedule'}), response.status_code
+        return None
 
-    soup = BeautifulSoup(response.text, 'html.parser')
-    table = soup.find('tbody', class_='Table__TBODY')
+    return BeautifulSoup(response.text, 'html.parser')
 
-    schedule = []
-    cols = None
-    header_row_0_found = False
-    for row in table.find_all('tr'):
-        if cols is None: 
-            if 'Table_Headers' in row.find('td')['class']:
-                if not header_row_0_found:
-                    header_row_0_found = True
-                else:
-                    cols = [header.text.strip() for header in row.find_all('td')]
-            continue
+def format_game_data(nba_teams_data, my_team_data, col_names, game_cells):
+    game_data = {col_names[i]: cell for i, cell in enumerate([col.text.strip() for col in game_cells])}
 
-        game_cells = row.find_all('td')
-        game_data = {cols[i]: cell for i, cell in enumerate([col.text.strip() for col in game_cells])}
+    game_data['datetime_utc'] = convert_to_utc(convert_date(game_data['DATE']), game_data['TIME'])
 
-        tv_cell = game_cells[cols.index('TV')]
-        if tv_cell.text == '':
-            for figure in tv_cell.find_all('figure'):
-                network = [cls for cls in figure['class'] if cls.startswith('network-')]
-                game_data['TV'] += network[0].replace('network-', '').upper()
-        if 'ABC' in game_data['TV']:
-            game_data['TV'] = 'ABC '
-        elif 'ESPN' in game_data['TV']:
-            game_data['TV'] = 'ESPN '
-        elif 'NBC' in game_data['TV']:
-            game_data['TV'] = 'NBC '
-        elif 'Peacock' in game_data['TV']:
-            game_data['TV'] = 'Peacock'
-        elif game_data['TV'] in ['Prime Video', 'NBA TV']:
-            pass
-        else:
-            game_data['TV'] = 'League Pass'
+    tv_cell = game_cells[col_names.index('TV')]
+    if tv_cell.text == '':
+        for figure in tv_cell.find_all('figure'):
+            network = [cls for cls in figure['class'] if cls.startswith('network-')]
+            game_data['TV'] += network[0].replace('network-', '').upper()
+    if 'ABC' in game_data['TV']:
+        game_data['channel'] = 'ABC'
+    elif 'ESPN' in game_data['TV']:
+        game_data['channel'] = 'ESPN'
+    elif 'NBC' in game_data['TV']:
+        game_data['channel'] = 'NBC'
+    elif 'Peacock' in game_data['TV']:
+        game_data['channel'] = 'Peacock'
+    elif game_data['TV'] in ['Prime Video', 'NBA TV']:
+        game_data['channel'] = game_data['TV']
+    else:
+        game_data['channel'] = 'League Pass'
 
-        game_data['DATE'] = convert_date(game_data['DATE'])
+    game_data['my_team'] = copy.deepcopy(my_team_data)
+    game_data['my_team']['is_home'] = not game_data['OPPONENT'].startswith('@')
 
-        game_data['DATETIME'] = convert_to_utc(game_data['DATE'], game_data['TIME'])
+    opponent_tc = " ".join(game_data['OPPONENT'].split(' ')[1:])
+    opp_team_data = [team for team in nba_teams_data if team.get("city") == opponent_tc][0]
+    game_data['opp_team'] = copy.deepcopy(opp_team_data)
+    game_data['opp_team']['is_home'] = not game_data['my_team']['is_home']
 
-        game_data['IS_HOME'] = not game_data['OPPONENT'].startswith('@')
-        game_data['OPPONENT'] = " ".join(game_data['OPPONENT'].split(' ')[1:])
+    game_data.pop('OPPONENT')
+    game_data.pop('TV')
+    game_data.pop('DATE')
+    game_data.pop('TIME')
+    game_data.pop('tickets')
 
-        game_data.pop('DATE')
-        game_data.pop('TIME')
-        game_data.pop('tickets')
-
-        schedule.append(game_data)
-
-    resp = {'upcoming_schedule': schedule}
-
-    if request.args.get('nbapiformat') == 'true':
-        return jsonify(convert_to_nba_api_format(resp))
-    
-    return jsonify(resp)
+    return game_data
 
 def convert_date(date_str):
     today = datetime.today()
@@ -101,7 +139,7 @@ def convert_to_utc(date_str, time_str):
 
     return utc_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
-def convert_to_nba_api_format(original_json):
+def convert_to_nba_api_format(original_json, nba_teams_data, my_team_data):
     def parse_datetime(dt_str):
         dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S %Z")
         gdte = dt.strftime("%Y-%m-%d")
@@ -110,105 +148,79 @@ def convert_to_nba_api_format(original_json):
         return gdte, utctm, etm
 
     games = []
-    for i, game in enumerate(original_json.get("upcoming_schedule", [])):
-        dt_str = game.get("DATETIME", "")
+    for game in original_json.get("upcoming_schedule", []):
+        dt_str = game["datetime_utc"]
         gdte, utctm, etm = parse_datetime(dt_str) if dt_str else ("", "", "")
-        
-        opponent = game.get("OPPONENT", "")
-        is_home = game.get("IS_HOME", False)
-        tv = game.get("TV", "")
 
-        gid = f"00125000{i+1:02d}"
-        gcode = f"{gdte.replace('-', '')}/{'LAL' + opponent[:3].upper()}" if gdte and opponent else ""
+        opponent = game["opp_team"]['city']
+        is_home = game["my_team"]['is_home']
+        tv = game["channel"]
 
-        home_team = NBA_TEAMS["Los Angeles"]
-        away_team = NBA_TEAMS.get(opponent, {"tid": "", "ta": "", "tn": "", "tc": opponent})
-
-        h_team = home_team if is_home else away_team
-        v_team = away_team if is_home else home_team
+        my_team_game_data = [team for team in nba_teams_data if team.get("city") == my_team_data.get("city")][0]
+        opp_team_game_data = [team for team in nba_teams_data if team.get("city") == opponent][0]
 
         game_obj = {
-            "gid": gid,
-            "gcode": gcode,
-            "seri": "",
-            "is": int(is_home),
-            "gdte": gdte,
-            "htm": etm,
-            "vtm": etm,
-            "etm": etm,
-            "an": "",
-            "ac": "",
-            "as": "",
-            "st": "",
-            "stt": "",
-            "bd": {
-                "b": []
-            },
-            "v": {
-                "tid": v_team["tid"],
-                "re": "",
-                "ta": v_team["ta"],
-                "tn": v_team["tn"],
-                "tc": v_team["tc"],
-                "s": ""
-            },
-            "h": {
-                "tid": h_team["tid"],
-                "re": "",
-                "ta": h_team["ta"],
-                "tn": h_team["tn"],
-                "tc": h_team["tc"],
-                "s": ""
-            },
             "gdtutc": gdte,
             "utctm": utctm,
-            "ppdst": ""
+            "bd": {
+                "b": [{"disp": tv}]
+            },
+            "v" if is_home else "h": {
+                "re": f"{opp_team_game_data['record-wins']}-{opp_team_game_data['record-losses']}",
+                "ta": opp_team_game_data["acronym"],
+                "tn": opp_team_game_data["nickname"],
+                "tc": opp_team_game_data["city"],
+            },
+            "h" if is_home else "v": {
+                "re": f"{my_team_game_data['record-wins']}-{my_team_game_data['record-losses']}",
+                "ta": my_team_game_data["acronym"],
+                "tn": my_team_game_data["nickname"],
+                "tc": my_team_game_data["city"],
+            }
         }
         games.append(game_obj)
 
     return {
         "gscd": {
-            "tid": NBA_TEAMS["Los Angeles"]["tid"],
             "g": games,
-            "ta": NBA_TEAMS["Los Angeles"]["ta"],
-            "tn": NBA_TEAMS["Los Angeles"]["tn"],
-            "tc": NBA_TEAMS["Los Angeles"]["tc"]
+            "ta": my_team_data["acronym"],
+            "tn": my_team_data["nickname"],
+            "tc": my_team_data["city"]
         }
     }
     
-NBA_TEAMS = {
-    "Atlanta":      {"tid": 1610612737, "ta": "ATL", "tn": "Hawks", "tc": "Atlanta"},
-    "Boston":       {"tid": 1610612738, "ta": "BOS", "tn": "Celtics", "tc": "Boston"},
-    "Brooklyn":     {"tid": 1610612751, "ta": "BKN", "tn": "Nets", "tc": "Brooklyn"},
-    "Charlotte":    {"tid": 1610612766, "ta": "CHA", "tn": "Hornets", "tc": "Charlotte"},
-    "Chicago":      {"tid": 1610612741, "ta": "CHI", "tn": "Bulls", "tc": "Chicago"},
-    "Cleveland":    {"tid": 1610612739, "ta": "CLE", "tn": "Cavaliers", "tc": "Cleveland"},
-    "Dallas":       {"tid": 1610612742, "ta": "DAL", "tn": "Mavericks", "tc": "Dallas"},
-    "Denver":       {"tid": 1610612743, "ta": "DEN", "tn": "Nuggets", "tc": "Denver"},
-    "Detroit":      {"tid": 1610612765, "ta": "DET", "tn": "Pistons", "tc": "Detroit"},
-    "Golden State": {"tid": 1610612744, "ta": "GSW", "tn": "Warriors", "tc": "Golden State"},
-    "Houston":      {"tid": 1610612745, "ta": "HOU", "tn": "Rockets", "tc": "Houston"},
-    "Indiana":      {"tid": 1610612754, "ta": "IND", "tn": "Pacers", "tc": "Indiana"},
-    "LA":  {"tid": 1610612746, "ta": "LAC", "tn": "Clippers", "tc": "LA"},
-    "Los Angeles":  {"tid": 1610612747, "ta": "LAL", "tn": "Lakers", "tc": "Los Angeles"},
-    "Memphis":      {"tid": 1610612763, "ta": "MEM", "tn": "Grizzlies", "tc": "Memphis"},
-    "Miami":        {"tid": 1610612748, "ta": "MIA", "tn": "Heat", "tc": "Miami"},
-    "Milwaukee":    {"tid": 1610612749, "ta": "MIL", "tn": "Bucks", "tc": "Milwaukee"},
-    "Minnesota":    {"tid": 1610612750, "ta": "MIN", "tn": "Timberwolves", "tc": "Minnesota"},
-    "New Orleans":  {"tid": 1610612740, "ta": "NOP", "tn": "Pelicans", "tc": "New Orleans"},
-    "New York":     {"tid": 1610612752, "ta": "NYK", "tn": "Knicks", "tc": "New York"},
-    "Oklahoma City":{"tid": 1610612760, "ta": "OKC", "tn": "Thunder", "tc": "Oklahoma City"},
-    "Orlando":      {"tid": 1610612753, "ta": "ORL", "tn": "Magic", "tc": "Orlando"},
-    "Philadelphia": {"tid": 1610612755, "ta": "PHI", "tn": "76ers", "tc": "Philadelphia"},
-    "Phoenix":      {"tid": 1610612756, "ta": "PHX", "tn": "Suns", "tc": "Phoenix"},
-    "Portland":     {"tid": 1610612757, "ta": "POR", "tn": "Trail Blazers", "tc": "Portland"},
-    "Sacramento":   {"tid": 1610612758, "ta": "SAC", "tn": "Kings", "tc": "Sacramento"},
-    "San Antonio":  {"tid": 1610612759, "ta": "SAS", "tn": "Spurs", "tc": "San Antonio"},
-    "Toronto":      {"tid": 1610612761, "ta": "TOR", "tn": "Raptors", "tc": "Toronto"},
-    "Utah":         {"tid": 1610612762, "ta": "UTA", "tn": "Jazz", "tc": "Utah"},
-    "Washington":   {"tid": 1610612764, "ta": "WAS", "tn": "Wizards", "tc": "Washington"}
-}
-
+NBA_TEAMS_DATA = [
+    {"name": "Atlanta Hawks", "acronym": "ATL", "espn-acronym": "ATL", "nickname": "Hawks", "city": "Atlanta", "url-name": "atlanta-hawks", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/atl.png"},
+    {"name": "Boston Celtics", "acronym": "BOS", "espn-acronym": "BOS", "nickname": "Celtics", "city": "Boston", "url-name": "boston-celtics", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/bos.png"},
+    {"name": "Brooklyn Nets", "acronym": "BKN", "espn-acronym": "BKN", "nickname": "Nets", "city": "Brooklyn", "url-name": "brooklyn-nets", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/bkn.png"},
+    {"name": "Charlotte Hornets", "acronym": "CHA", "espn-acronym": "CHA", "nickname": "Hornets", "city": "Charlotte", "url-name": "charlotte-hornets", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/cha.png"},
+    {"name": "Chicago Bulls", "acronym": "CHI", "espn-acronym": "CHI", "nickname": "Bulls", "city": "Chicago", "url-name": "chicago-bulls", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/chi.png"},
+    {"name": "Cleveland Cavaliers", "acronym": "CLE", "espn-acronym": "CLE", "nickname": "Cavaliers", "city": "Cleveland", "url-name": "cleveland-cavaliers", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/cle.png"},
+    {"name": "Dallas Mavericks", "acronym": "DAL", "espn-acronym": "DAL", "nickname": "Mavericks", "city": "Dallas", "url-name": "dallas-mavericks", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/dal.png"},
+    {"name": "Denver Nuggets", "acronym": "DEN", "espn-acronym": "DEN", "nickname": "Nuggets", "city": "Denver", "url-name": "denver-nuggets", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/den.png"},
+    {"name": "Detroit Pistons", "acronym": "DET", "espn-acronym": "DET", "nickname": "Pistons", "city": "Detroit", "url-name": "detroit-pistons", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/det.png"},
+    {"name": "Golden State Warriors", "acronym": "GSW", "espn-acronym": "GS", "nickname": "Warriors", "city": "Golden State", "url-name": "golden-state-warriors", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/gs.png"},
+    {"name": "Houston Rockets", "acronym": "HOU", "espn-acronym": "HOU", "nickname": "Rockets", "city": "Houston", "url-name": "houston-rockets", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/hou.png"},
+    {"name": "Indiana Pacers", "acronym": "IND", "espn-acronym": "IND", "nickname": "Pacers", "city": "Indiana", "url-name": "indiana-pacers", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/ind.png"},
+    {"name": "LA Clippers", "acronym": "LAC", "espn-acronym": "LAC", "nickname": "Clippers", "city": "LA", "url-name": "la-clippers", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/lac.png"},
+    {"name": "Los Angeles Lakers", "acronym": "LAL", "espn-acronym": "LAL", "nickname": "Lakers", "city": "Los Angeles", "url-name": "los-angeles-lakers", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/lal.png"},
+    {"name": "Memphis Grizzlies", "acronym": "MEM", "espn-acronym": "MEM", "nickname": "Grizzlies", "city": "Memphis", "url-name": "memphis-grizzlies", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/mem.png"},
+    {"name": "Miami Heat", "acronym": "MIA", "espn-acronym": "MIA", "nickname": "Heat", "city": "Miami", "url-name": "miami-heat", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/mia.png"},
+    {"name": "Milwaukee Bucks", "acronym": "MIL", "espn-acronym": "MIL", "nickname": "Bucks", "city": "Milwaukee", "url-name": "milwaukee-bucks", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/mil.png"},
+    {"name": "Minnesota Timberwolves", "acronym": "MIN", "espn-acronym": "MIN", "nickname": "Timberwolves", "city": "Minnesota", "url-name": "minnesota-timberwolves", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/min.png"},
+    {"name": "New Orleans Pelicans", "acronym": "NOP", "espn-acronym": "NO", "nickname": "Pelicans", "city": "New Orleans", "url-name": "new-orleans-pelicans", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/nop.png"},
+    {"name": "New York Knicks", "acronym": "NYK", "espn-acronym": "NY", "nickname": "Knicks", "city": "New York", "url-name": "new-york-knicks", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/nyk.png"},
+    {"name": "Oklahoma City Thunder", "acronym": "OKC", "espn-acronym": "OKC", "nickname": "Thunder", "city": "Oklahoma City", "url-name": "oklahoma-city-thunder", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/okc.png"},
+    {"name": "Orlando Magic", "acronym": "ORL", "espn-acronym": "ORL", "nickname": "Magic", "city": "Orlando", "url-name": "orlando-magic", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/orl.png"},
+    {"name": "Philadelphia 76ers", "acronym": "PHI", "espn-acronym": "PHI", "nickname": "76ers", "city": "Philadelphia", "url-name": "philadelphia-76ers", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/phi.png"},
+    {"name": "Phoenix Suns", "acronym": "PHX", "espn-acronym": "PHX", "nickname": "Suns", "city": "Phoenix", "url-name": "phoenix-suns", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/phx.png"},
+    {"name": "Portland Trail Blazers", "acronym": "POR", "espn-acronym": "POR", "nickname": "Trail Blazers", "city": "Portland", "url-name": "portland-trail-blazers", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/por.png"},
+    {"name": "Sacramento Kings", "acronym": "SAC", "espn-acronym": "SAC", "nickname": "Kings", "city": "Sacramento", "url-name": "sacramento-kings", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/sac.png"},
+    {"name": "San Antonio Spurs", "acronym": "SAS", "espn-acronym": "SAS", "nickname": "Spurs", "city": "San Antonio", "url-name": "san-antonio-spurs", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/sas.png"},
+    {"name": "Toronto Raptors", "acronym": "TOR", "espn-acronym": "TOR", "nickname": "Raptors", "city": "Toronto", "url-name": "toronto-raptors", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/tor.png"},
+    {"name": "Utah Jazz", "acronym": "UTA", "espn-acronym": "UTA", "nickname": "Jazz", "city": "Utah", "url-name": "utah-jazz", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/uta.png"},
+    {"name": "Washington Wizards", "acronym": "WAS", "espn-acronym": "WSH", "nickname": "Wizards", "city": "Washington", "url-name": "washington-wizards", "logo-url": "https://a.espncdn.com/i/teamlogos/nba/500/was.png"}
+]
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=10000)

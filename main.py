@@ -1,5 +1,6 @@
 # https://dashboard.render.com/web/srv-d3sq1lhr0fns738mcp9g
 
+import re
 from flask import Flask, jsonify, request
 import requests
 from bs4 import BeautifulSoup
@@ -27,11 +28,14 @@ def fetch_standings_data(nba_teams_data):
         return jsonify({'error': f'Failed to parse standings: {url}'}), 500
     tables = soup.find_all('tbody', class_='Table__TBODY')
 
+    def matches_letters_prefix(text, target, length=3):
+        return re.sub(r'[^a-zA-Z]', '', text)[:length].lower() == target.lower()
+
     for i, table in enumerate(tables):
         conf = 'W' if i > 1 else 'E'
         for conf_rank, row in enumerate(table.find_all('tr')):
             if i % 2 == 0:
-                team_data = [team for team in nba_teams_data if team.get("espn-acronym") in [row.text[:2], row.text[:3]]][0]
+                team_data = [team for team in nba_teams_data if matches_letters_prefix(row.text, team.get("espn-acronym"), 2) or matches_letters_prefix(row.text, team.get("espn-acronym"), 3)][0]
                 team_data['conf'] = conf
                 team_data['conf_rank'] = conf_rank + 1
             else:
